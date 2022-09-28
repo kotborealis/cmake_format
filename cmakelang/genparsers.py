@@ -16,7 +16,10 @@ import re
 import sys
 
 import cmakelang
-from cmakelang.format import __main__
+from cmakelang.format.utils import (yaml_odict_handler,
+                                    yaml_register_odict,
+                                    detect_line_endings,
+                                    collect_directory)
 from cmakelang import configuration
 from cmakelang import lex
 from cmakelang import parse
@@ -174,8 +177,6 @@ def process_tree(parse_tree):
   for statement in find_statements_in_subtree(
       parse_tree, ("function", "macro")):
     fnname, spec = process_defn(statement)
-    if fnname.startswith("_"):
-      continue
     out[fnname] = spec
   return out
 
@@ -186,7 +187,7 @@ def process_file(config, infile_content):
   """
 
   if config.format.line_ending == 'auto':
-    detected = __main__.detect_line_endings(infile_content)
+    detected = detect_line_endings(infile_content)
     config = config.clone()
     config.set_line_ending(detected)
 
@@ -198,6 +199,36 @@ def process_file(config, infile_content):
   parse_tree.build_ancestry()
   return parse_tree
 
+
+def generate_parsers(infilepaths):
+  outdict = collections.OrderedDict()
+
+  for infile_path in infilepaths:
+    cfg = configuration.Configuration()
+
+    try:
+      infile = io.open(
+          infile_path, mode='r', encoding=cfg.encode.input_encoding, newline='')
+    except (IOError, OSError):
+      logger.error("Failed to open %s for read", infile_path)
+      raise
+
+    try:
+      with infile:
+        intext = infile.read()
+    except UnicodeDecodeError:
+      logger.error(
+          "Unable to read %s as %s", infile_path, cfg.encode.input_encoding)
+
+    try:
+      parse_tree = process_file(cfg, intext)
+      cmd_spec = process_tree(parse_tree)
+      outdict.update(cmd_spec)
+    except:
+      logger.warning('While processing %s', infile_path)
+      raise
+  
+  return outdict
 
 def setup_argparse(argparser):
   argparser.add_argument('-v', '--version', action='version',
@@ -244,42 +275,23 @@ def main():
     outfile_arg = os.dup(sys.stdout.fileno())
 
   returncode = 0
-  outdict = collections.OrderedDict()
-  for infile_path in args.infilepaths:
-    print(infile_path)
-    cfg = configuration.Configuration()
-    if infile_path == '-':
-      infile_path = os.dup(sys.stdin.fileno())
 
-    try:
-      infile = io.open(
-          infile_path, mode='r', encoding=cfg.encode.input_encoding, newline='')
-    except (IOError, OSError):
-      logger.error("Failed to open %s for read", infile_path)
-      returncode = 1
+  infilepaths = args.infilepaths
 
-    try:
-      with infile:
-        intext = infile.read()
-    except UnicodeDecodeError:
-      logger.error(
-          "Unable to read %s as %s", infile_path, cfg.encode.input_encoding)
+  for infile_path in infilepaths[:]:
+    if os.path.isdir(infile_path):
+      infilepaths.remove(infile_path)
+      infilepaths.extend(collect_directory(infile_path))
 
-    try:
-      parse_tree = process_file(cfg, intext)
-      cmd_spec = process_tree(parse_tree)
-      outdict.update(cmd_spec)
-    except:
-      logger.warning('While processing %s', infile_path)
-      raise
+  outdict = generate_parsers(infilepaths)
 
   outfile = io.open(outfile_arg, mode='w', encoding="utf-8", newline='')
   if args.output_format == "json":
     json.dump(outdict, outfile, indent=2)
   elif args.output_format == "yaml":
     import yaml
-    __main__.yaml_register_odict(yaml.SafeDumper)
-    __main__.yaml_register_odict(yaml.Dumper)
+    yaml_register_odict(yaml.SafeDumper)
+    yaml_register_odict(yaml.Dumper)
     yaml.dump(outdict,
               outfile, indent=2,
               default_flow_style=False, sort_keys=False)

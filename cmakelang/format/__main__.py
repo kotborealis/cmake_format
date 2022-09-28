@@ -40,18 +40,14 @@ from cmakelang.parse.argument_nodes import StandardParser2
 from cmakelang.parse.common import NodeType, TreeNode
 from cmakelang.parse.printer import dump_tree as dump_parse
 from cmakelang.parse.funs import standard_funs
+from cmakelang.genparsers import generate_parsers
+from cmakelang.format.utils import (yaml_odict_handler,
+                                    yaml_register_odict,
+                                    detect_line_endings,
+                                    collect_directory)
 
 
 logger = logging.getLogger(__name__)
-
-
-def detect_line_endings(infile_content):
-  windows_count = infile_content.count('\r\n')
-  unix_count = infile_content.count('\n') - windows_count
-  if windows_count > unix_count:
-    return 'windows'
-
-  return 'unix'
 
 
 def dump_markup(nodes, config, outfile=None, indent=None):
@@ -130,6 +126,53 @@ def dump_parsedb(parsedb, outfile=None, indent=None):
     else:
       outfile.write(": {}\n".format(type(value)))
 
+def find_legacy_guarded_body(parse_tree):
+  body = parse_tree
+
+  if parse_tree.node_type != NodeType.BODY:
+    return None
+
+  ifBlockNode = parse_tree.children[0]
+
+  if not repr(ifBlockNode).startswith("IfBlockNode: "):
+    return None
+
+  ifStartNode = ifBlockNode.children[0]
+
+  if ifStartNode.children[0].children[0].content.lower() != 'if':
+    return None
+
+  ifEndNode = ifBlockNode.children[2]
+
+  if ifEndNode.children[0].children[0].content.lower() != 'endif':
+    return None
+
+  ifStartTokens = ifStartNode.get_semantic_tokens()
+
+  if (ifStartTokens[0].content.lower() != 'if'
+      or ifStartTokens[1].content != '('
+      or ifStartTokens[2].content.lower() != 'not'
+      or ifStartTokens[4].content != ')'):
+    return None
+
+  guard_variable = ifStartTokens[3].content
+
+  ifBodyNode = ifBlockNode.children[1]
+
+  ifBodyTokens = ifBodyNode.get_semantic_tokens()
+
+  if (ifBodyTokens[0].content.lower() != 'set'
+      or ifBodyTokens[1].content != '('
+      or ifBodyTokens[2].content != guard_variable
+      or ifBodyTokens[4].content != ')'):
+    return None
+
+  for child in ifBodyNode.children[:]:
+    if child.node_type == NodeType.STATEMENT:
+      ifBodyNode.children.remove(child)
+      break
+
+  return ifBodyNode
 
 def process_file(config, infile_content, dump=None):
   """
@@ -156,6 +199,13 @@ def process_file(config, infile_content, dump=None):
 
   ctx = parse.ParseContext(parse_db, config=config)
   parse_tree = parse.parse(tokens, ctx)
+
+  guarded_body = find_legacy_guarded_body(parse_tree)
+  needs_include_guard = guarded_body is not None
+
+  if guarded_body is not None:
+    parse_tree = guarded_body
+
   if dump == "parse":
     dump_parse([parse_tree], outfile)
     return outfile.getvalue(), True
@@ -173,6 +223,10 @@ def process_file(config, infile_content, dump=None):
     outstr = "\ufeff" + outstr
 
   outstr = formatter.replace_with_tabs(outstr, config)
+
+  if needs_include_guard:
+    outstr = "include_guard()\n\n" + outstr
+
   return (outstr, box_tree.reflow_valid)
 
 
@@ -359,20 +413,6 @@ def get_config(infile_path, configfile_paths):
   return get_configdict(configfile_paths)
 
 
-def yaml_odict_handler(dumper, value):
-  """
-  Represent ordered dictionaries as yaml maps.
-  """
-  return dumper.represent_mapping(u'tag:yaml.org,2002:map', value)
-
-
-def yaml_register_odict(dumper):
-  """
-  Register an order dictionary handler with the given yaml dumper
-  """
-  dumper.add_representer(collections.OrderedDict, yaml_odict_handler)
-
-
 def dump_config(args, config_dict, outfile):
   """
   Dump the default configuration to stdout
@@ -461,6 +501,12 @@ def setup_argparser(argparser):
   argparser.add_argument(
       '-c', '--config-files', nargs='+', action='extend',
       help='path to configuration file(s)')
+
+  argparser.add_argument(
+    '--context', nargs='+',
+    help="Consider specified directories and files as formatting context; "
+         "context will be used to update `additional_commands` in configuration file")
+
   argparser.add_argument('infilepaths', nargs='*')
 
   configuration.Configuration().add_to_argparser(argparser)
@@ -496,7 +542,7 @@ def get_argdict(args):
   return out
 
 
-def onefile_main(infile_path, args, argparse_dict):
+def onefile_main(infile_path, args, argparse_dict, context_parsers):
   """
   Find config, open file, process, write result
   """
@@ -506,6 +552,11 @@ def onefile_main(infile_path, args, argparse_dict):
     config_dict = get_config(os.getcwd(), args.config_files)
   else:
     config_dict = get_config(infile_path, args.config_files)
+
+  config_dict['parse']['additional_commands'] = {
+    **context_parsers,
+    **config_dict['parse']['additional_commands']
+  }
 
   cfg = configuration.Configuration(**config_dict)
   cfg.legacy_consume(argparse_dict)
@@ -610,10 +661,29 @@ def inner_main():
 
   argparse_dict = get_argdict(args)
 
+  context_parsers = {}
+
+  # if context fileas are specified,
+  # parse them and update parse.additional_commands
+  if 'context' in argparse_dict:
+    contextFiles = argparse_dict['context']
+    for file in contextFiles[:]:
+      if os.path.isdir(file):
+        contextFiles.remove(file)
+        contextFiles.extend(collect_directory(file))
+
+    context_parsers = dict(generate_parsers(argparse_dict['context']))
+
+  # expand directories in input files
+  for file in args.infilepaths[:]:
+    if os.path.isdir(file):
+      args.infilepaths.remove(file)
+      args.infilepaths.extend(collect_directory(file))
+
   returncode = 0
   for infile_path in args.infilepaths:
     try:
-      onefile_main(infile_path, args, argparse_dict)
+      onefile_main(infile_path, args, argparse_dict, context_parsers)
     except common.FormatError as ex:
       logger.error(ex.msg)
       returncode = 1
